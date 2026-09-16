@@ -22,7 +22,7 @@ Hive setup is conversational. Do not require a setup UI.
 
 ## Discovery
 
-1. Check whether `hive.json` already exists in the current directory.
+1. Check for `.hive/config.json`, `.hive.json`, or `hive.json` in the current directory and its ancestors through the project root. Stop and ask if several candidates exist.
 2. If the OpenChamber tool is available:
    - Call `projects.list` for registered project names and roots.
    - Call `models.list` before offering model choices.
@@ -69,7 +69,7 @@ TODO.md
 PROGRESS.md
 ```
 
-The Hive plugin discovers `hive.json` in the current directory. No global Hive config edit is needed.
+The globally enabled Hive plugin discovers `.hive/config.json`, `.hive.json`, or `hive.json` through the project boundary. No global Hive config edit is needed.
 
 After the user approves the configuration:
 

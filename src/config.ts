@@ -1,5 +1,5 @@
 import { stat } from "node:fs/promises"
-import { dirname, isAbsolute, resolve } from "node:path"
+import { dirname, isAbsolute, join, parse, resolve, sep } from "node:path"
 
 export type HivePermissionMode = "ask" | "auto"
 
@@ -228,7 +228,45 @@ export async function assertWorkspaceDirectory(workspace: HiveWorkspace): Promis
   if (!info.isDirectory()) throw new Error(`Workspace path is not a directory: ${workspace.directory}`)
 }
 
-export function configPathsFromOptions(options: Readonly<Record<string, unknown>>, location: string): string[] {
+export const hiveConfigLocations = [".hive/config.json", ".hive.json", "hive.json"] as const
+
+async function isFile(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isFile()
+  } catch {
+    return false
+  }
+}
+
+export async function discoverHiveConfigPaths(directory: string, projectDirectory?: string): Promise<string[]> {
+  const start = resolve(directory)
+  const requestedBoundary = projectDirectory ? resolve(projectDirectory) : start
+  const boundary =
+    requestedBoundary !== parse(requestedBoundary).root &&
+    (start === requestedBoundary || start.startsWith(`${requestedBoundary}${sep}`))
+      ? requestedBoundary
+      : start
+  const found: string[] = []
+
+  let current = start
+  while (true) {
+    for (const location of hiveConfigLocations) {
+      const candidate = join(current, location)
+      if (await isFile(candidate)) found.push(candidate)
+    }
+    if (current === boundary) break
+    const parent = dirname(current)
+    if (parent === current || !parent.startsWith(boundary)) break
+    current = parent
+  }
+
+  if (found.length > 1) {
+    throw new Error(`Multiple Hive configs found; keep one or choose explicitly:\n${found.join("\n")}`)
+  }
+  return found
+}
+
+export function configPathsFromOptions(options: Readonly<Record<string, unknown>>): string[] {
   const configured = options.configs
   if (configured !== undefined) {
     if (!Array.isArray(configured) || configured.some((path) => typeof path !== "string")) {
@@ -239,5 +277,5 @@ export function configPathsFromOptions(options: Readonly<Record<string, unknown>
       return path
     })
   }
-  return [resolve(location, "hive.json")]
+  return []
 }

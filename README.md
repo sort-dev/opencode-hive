@@ -32,23 +32,20 @@ The plugin API used here is not compatible with OpenCode V1.
 
 Copy `examples/hive.json` and `examples/AGENTS.md` into a separate Hive directory. Replace the example workspace paths with absolute paths or paths relative to `hive.json`.
 
-Configure the plugin globally in V2 using an absolute config path:
+Configure the plugin globally in V2. The plugin does not require a Hive configuration merely to load:
 
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
   "plugins": [
-    {
-      "package": "/absolute/path/to/opencode-hive",
-      "options": {
-        "configs": ["/absolute/path/to/my-hive/hive.json"]
-      }
-    }
+    "/absolute/path/to/opencode-hive"
   ]
 }
 ```
 
-The global install lets worker sessions use `hive_report` from other project directories.
+The global install provides the `create-hive` skill and Hive tools in every covered project. In a directory without a Hive, say "create me a Hive here." Tools that require an existing Hive explain that setup is needed.
+
+Hive discovery checks the current directory and its ancestors through the OpenCode project boundary. It accepts `.hive/config.json`, `.hive.json`, or `hive.json`. Competing files are rejected instead of choosing one silently. Worker sessions retain the originating config path in their durable Hive mapping, so their report and backfill tools do not require a local config file.
 
 For development, load the compiled root entrypoint and run `bun run verify` before restarting OpenCode. The root `index.js` imports `dist/index.js`, so edits under `src/` do not hot-reload active locations until a new build changes the artifact.
 

@@ -2,11 +2,11 @@ import { Plugin } from "@opencode/plugin"
 import type { Context } from "@opencode/plugin/promise/plugin"
 import type { ToolContext } from "@opencode/plugin/promise/tool"
 import { createHash } from "node:crypto"
-import { resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import {
   assertWorkspaceDirectory,
   configPathsFromOptions,
+  discoverHiveConfigPaths,
   loadHiveConfig,
   resolveWorkspace,
   type HiveAgent,
@@ -559,18 +559,14 @@ function dispatchPrompt(input: {
 }
 
 async function configuredHives(ctx: Context): Promise<HiveConfig[]> {
-  const localPath = resolve(ctx.location.directory, "hive.json")
-  const paths = [...new Set([...configPathsFromOptions(ctx.options, ctx.location.directory), localPath])]
+  const discovered = await discoverHiveConfigPaths(
+    ctx.location.directory,
+    ctx.location.project?.directory,
+  )
+  const paths = [...new Set([...configPathsFromOptions(ctx.options), ...discovered])]
   const hives: HiveConfig[] = []
   for (const path of paths) {
-    try {
-      hives.push(await loadHiveConfig(path))
-    } catch (error) {
-      if (path === localPath && error instanceof Error) {
-        if (error.message.startsWith("Hive config does not exist:")) continue
-      }
-      throw error
-    }
+    hives.push(await loadHiveConfig(path))
   }
   const ids = new Set<string>()
   for (const hive of hives) {
@@ -597,7 +593,9 @@ async function selectHive(
     if (hive) return hive
   }
   if (hives.length === 1) return hives[0]
-  if (hives.length === 0) throw new Error("No Hive configs are available at this location")
+  if (hives.length === 0) {
+    throw new Error("No Hive is configured here. Say 'create me a Hive here' to start setup.")
+  }
   throw new Error("More than one Hive is configured; specify a Hive ID")
 }
 

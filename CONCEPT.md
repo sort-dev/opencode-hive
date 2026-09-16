@@ -636,9 +636,10 @@ project/
 
 Config discovery should check `.hive/config.json`, `.hive.json`, and
 `hive.json`. Finding more than one candidate is an error that requires user
-selection. Embedded files may be committed for a shared Hive or ignored for a
-personal Hive. Machine-specific absolute paths and secret values should not be
-committed.
+selection. Discovery walks from the active directory through its OpenCode
+project boundary and does not scan unrelated parents. Embedded files may be
+committed for a shared Hive or ignored for a personal Hive. Machine-specific
+absolute paths and secret values should not be committed.
 
 Minimal machine state may be stored separately for IDs, session mappings,
 delivery state, and locks. Human knowledge stays readable.

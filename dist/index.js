@@ -2,12 +2,11 @@
 // src/index.ts
 import { Plugin } from "@opencode/plugin";
 import { createHash } from "crypto";
-import { resolve as resolve2 } from "path";
 import { fileURLToPath } from "url";
 
 // src/config.ts
 import { stat } from "fs/promises";
-import { dirname, isAbsolute, resolve } from "path";
+import { dirname, isAbsolute, join, parse, resolve, sep } from "path";
 function object(value, label) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error(`${label} must be an object`);
@@ -165,7 +164,41 @@ async function assertWorkspaceDirectory(workspace) {
   if (!info.isDirectory())
     throw new Error(`Workspace path is not a directory: ${workspace.directory}`);
 }
-function configPathsFromOptions(options, location) {
+var hiveConfigLocations = [".hive/config.json", ".hive.json", "hive.json"];
+async function isFile(path) {
+  try {
+    return (await stat(path)).isFile();
+  } catch {
+    return false;
+  }
+}
+async function discoverHiveConfigPaths(directory, projectDirectory) {
+  const start = resolve(directory);
+  const requestedBoundary = projectDirectory ? resolve(projectDirectory) : start;
+  const boundary = requestedBoundary !== parse(requestedBoundary).root && (start === requestedBoundary || start.startsWith(`${requestedBoundary}${sep}`)) ? requestedBoundary : start;
+  const found = [];
+  let current = start;
+  while (true) {
+    for (const location of hiveConfigLocations) {
+      const candidate = join(current, location);
+      if (await isFile(candidate))
+        found.push(candidate);
+    }
+    if (current === boundary)
+      break;
+    const parent = dirname(current);
+    if (parent === current || !parent.startsWith(boundary))
+      break;
+    current = parent;
+  }
+  if (found.length > 1) {
+    throw new Error(`Multiple Hive configs found; keep one or choose explicitly:
+${found.join(`
+`)}`);
+  }
+  return found;
+}
+function configPathsFromOptions(options) {
   const configured = options.configs;
   if (configured !== undefined) {
     if (!Array.isArray(configured) || configured.some((path) => typeof path !== "string")) {
@@ -177,7 +210,7 @@ function configPathsFromOptions(options, location) {
       return path;
     });
   }
-  return [resolve(location, "hive.json")];
+  return [];
 }
 
 // src/index.ts
@@ -568,19 +601,11 @@ ${input.memoryItems.map((item) => `- ${item}`).join(`
 `);
 }
 async function configuredHives(ctx) {
-  const localPath = resolve2(ctx.location.directory, "hive.json");
-  const paths = [...new Set([...configPathsFromOptions(ctx.options, ctx.location.directory), localPath])];
+  const discovered = await discoverHiveConfigPaths(ctx.location.directory, ctx.location.project?.directory);
+  const paths = [...new Set([...configPathsFromOptions(ctx.options), ...discovered])];
   const hives = [];
   for (const path of paths) {
-    try {
-      hives.push(await loadHiveConfig(path));
-    } catch (error) {
-      if (path === localPath && error instanceof Error) {
-        if (error.message.startsWith("Hive config does not exist:"))
-          continue;
-      }
-      throw error;
-    }
+    hives.push(await loadHiveConfig(path));
   }
   const ids = new Set;
   for (const hive of hives) {
@@ -605,8 +630,9 @@ async function selectHive(ctx, hives, sessionID, requested) {
   }
   if (hives.length === 1)
     return hives[0];
-  if (hives.length === 0)
-    throw new Error("No Hive configs are available at this location");
+  if (hives.length === 0) {
+    throw new Error("No Hive is configured here. Say 'create me a Hive here' to start setup.");
+  }
   throw new Error("More than one Hive is configured; specify a Hive ID");
 }
 var src_default = Plugin.define({
@@ -1336,4 +1362,4 @@ export {
   src_default as default
 };
 
-//# debugId=6E21FECBF97910A164756E2164756E21
+//# debugId=7904DDFCDE0A874764756E2164756E21

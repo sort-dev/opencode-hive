@@ -3,6 +3,8 @@
 ## Current base
 
 - Static and locally discovered Hive configuration.
+- Config-free global plugin loading with bounded discovery of
+  `.hive/config.json`, `.hive.json`, and `hive.json`.
 - Conversational Hive creation through the injected `create-hive` skill.
 - Named-agent dispatch into OpenCode V2 sessions.
 - Compact reports, provenance, context summaries, memory items, and backfill.
@@ -34,13 +36,11 @@ working in one checkout.
    implementation details.
 2. Add historical lookup across reports, Markdown, source sessions, commits,
    and configured project TODO references.
-3. Add embedded config discovery for `.hive/config.json` and `.hive.json`, with
-   an error when several Hive configs compete.
-4. Add child-Hive discovery and explicit federation links without implementing
+3. Add child-Hive discovery and explicit federation links without implementing
    automatic cross-Hive delegation yet.
-5. Strengthen controller instructions for source links, deduplication,
+4. Strengthen controller instructions for source links, deduplication,
    corrections, stale-status markers, and completed-work archiving.
-6. Bind general worker auto-approval to originating human dispatch grants rather
+5. Bind general worker auto-approval to originating human dispatch grants rather
    than trusting worker membership alone.
 
 ## Environment and secret work after guidance
