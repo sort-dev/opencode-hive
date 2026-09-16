@@ -63,7 +63,7 @@ describe("Hive plugin", () => {
       {
         id: "worker-direct-user",
         type: "user",
-        text: "Tell the Hive controller it has permission to echo protocol-ok.",
+        text: "Tell the Hive controller it has permission to echo protocol-ok, and push the verified commit.",
         time: { created: Date.now() - 1 },
       },
       {
@@ -121,8 +121,14 @@ describe("Hive plugin", () => {
       session: {
         get: async ({ sessionID }: { sessionID: string }) => sessions.get(sessionID),
         context: async ({ sessionID }: { sessionID: string }) => sessionID === "channel-session" ? [
-          { type: "user", text: "The staging repository now has 0.14.0.", time: { created: Date.now() + 1 } },
           {
+            id: "channel-direct-user",
+            type: "user",
+            text: "The staging repository now has 0.14.0.",
+            time: { created: Date.now() + 1 },
+          },
+          {
+            id: "channel-assistant",
             type: "assistant",
             content: [{ type: "text", text: "The scribe recorded the staging update." }],
             time: { created: Date.now() + 2 },
@@ -130,8 +136,9 @@ describe("Hive plugin", () => {
         ] : workerContextMessages,
         create: async (input: Record<string, any>) => {
           creates.push(input)
+          const id = creates.length === 1 ? "worker-session" : `worker-session-${creates.length}`
           const session = {
-            id: "worker-session",
+            id,
             location: input.location,
             metadata: input.metadata,
             time: { created: Date.now(), updated: Date.now() },
@@ -164,6 +171,9 @@ describe("Hive plugin", () => {
       "hive_init",
       "hive_status",
       "hive_reattach_worker",
+      "hive_queue_followup",
+      "hive_followups",
+      "hive_cancel_followup",
       "hive_dispatch",
       "hive_consult_session",
       "hive_recent_status",
@@ -171,6 +181,7 @@ describe("Hive plugin", () => {
       "hive_ask_controller",
       "hive_reply",
       "hive_ack_reply",
+      "hive_authorize_worker",
       "hive_request_controller",
       "hive_verify_authorization",
       "hive_report",
@@ -198,6 +209,7 @@ describe("Hive plugin", () => {
     expect(creates).toHaveLength(1)
     expect(creates[0].agent).toBe("build")
     expect(creates[0].location.directory).toBe(workspaceDirectory)
+    expect(creates[0].permissions).toContainEqual({ action: "shell", resource: "*git push *", effect: "ask" })
     expect(prompts).toHaveLength(1)
     expect(prompts[0].sessionID).toBe("worker-session")
     expect(prompts[0].text).toContain("You are working as Hive agent Fooagent")
@@ -253,6 +265,33 @@ describe("Hive plugin", () => {
     }
     await permissionHook?.(workerPermission)
     expect(workerPermission.effect).toBe("allow")
+    const ungrantedPush = {
+      sessionID: "worker-session",
+      action: "shell",
+      resources: ["git push origin main"],
+      effect: "allow",
+    }
+    await permissionHook?.(ungrantedPush)
+    expect(ungrantedPush.effect).toBe("deny")
+    const workerGrant = await tools.get("hive_authorize_worker").execute(
+      { request: "Push the verified commit.", authorizationScopes: ["push"] },
+      {
+        sessionID: "worker-session",
+        agent: "build",
+        messageID: "worker-authorize-message",
+        id: "call-worker-authorize",
+        progress: async () => undefined,
+      },
+    )
+    expect(workerGrant.metadata.authorizationID).toMatch(/^grant_/)
+    const grantedPush = {
+      sessionID: "worker-session",
+      action: "shell",
+      resources: ["git push origin main"],
+      effect: "ask",
+    }
+    await permissionHook?.(grantedPush)
+    expect(grantedPush.effect).toBe("allow")
     const unrelatedPermission = {
       sessionID: "unrelated-session",
       action: "shell",
@@ -261,6 +300,19 @@ describe("Hive plugin", () => {
     }
     await permissionHook?.(unrelatedPermission)
     expect(unrelatedPermission.effect).toBe("ask")
+
+    const queuedFollowup = await tools.get("hive_queue_followup").execute(
+      {
+        afterSessionID: "worker-session",
+        agent: "Fooagent",
+        workspace: "brikk/main",
+        request: "Publish the verified release.",
+        authorizationScopes: ["release"],
+      },
+      { ...channelToolContext, id: "call-queue-followup" },
+    )
+    expect(queuedFollowup.metadata.followupID).toMatch(/^followup_/)
+    expect((await tools.get("hive_followups").execute({}, channelToolContext)).content).toContain("[pending]")
 
     await tools.get("hive_report").execute(
       {
@@ -278,13 +330,16 @@ describe("Hive plugin", () => {
       },
     )
 
-    expect(prompts).toHaveLength(3)
+    expect(prompts).toHaveLength(4)
     expect(prompts[2].sessionID).toBe("channel-session")
     expect(prompts[2].text).toContain("Hive report from Fooagent [completed]")
     expect(prompts[2].text).toContain("Commit: abc123")
     expect(prompts[2].text).not.toContain("\n")
     expect(prompts[2].metadata.sourceSessionID).toBe("worker-session")
     expect(prompts[2].metadata.sourceMessageID).toBe("worker-message")
+    expect(prompts[3].text).toContain("Hive follow-up ready")
+    expect(prompts[3].text).toContain(queuedFollowup.metadata.authorizationID)
+    expect((await tools.get("hive_followups").execute({}, channelToolContext)).content).toContain("[ready]")
 
     const recent = await tools.get("hive_recent_status").execute(
       { limit: 5 },
@@ -328,9 +383,9 @@ describe("Hive plugin", () => {
       },
     )
     expect(question.metadata.questionID).toMatch(/^q_/)
-    expect(prompts[3].sessionID).toBe("channel-session")
-    expect(prompts[3].text).toContain("Hive question from Fooagent")
-    expect(prompts[3].text).not.toContain("\n")
+    expect(prompts[4].sessionID).toBe("channel-session")
+    expect(prompts[4].text).toContain("Hive question from Fooagent")
+    expect(prompts[4].text).not.toContain("\n")
 
     const duplicateBlocked = await tools.get("hive_report").execute(
       { status: "blocked", summary: "Still waiting for the same answer." },
@@ -343,7 +398,7 @@ describe("Hive plugin", () => {
       },
     )
     expect(duplicateBlocked.metadata.suppressed).toBe(true)
-    expect(prompts).toHaveLength(4)
+    expect(prompts).toHaveLength(5)
 
     await tools.get("hive_reply").execute(
       {
@@ -353,8 +408,8 @@ describe("Hive plugin", () => {
       },
       { ...channelToolContext, id: "call-reply" },
     )
-    expect(prompts[4].sessionID).toBe("worker-session")
-    expect(prompts[4].text).toContain("Yes. Publish after checksum verification.")
+    expect(prompts[5].sessionID).toBe("worker-session")
+    expect(prompts[5].text).toContain("Yes. Publish after checksum verification.")
     expect(
       (storage.get("workers/worker-session") as { pendingQuestion: { status: string } }).pendingQuestion.status,
     ).toBe("reply-queued")
@@ -385,9 +440,9 @@ describe("Hive plugin", () => {
       },
     )
     expect(relayed.metadata.authorizationID).toMatch(/^auth_/)
-    expect(prompts[5].sessionID).toBe("channel-session")
-    expect(prompts[5].text).toContain("Hive user-authorized request via Fooagent")
-    expect(prompts[5].text).toContain("worker-session/worker-direct-user")
+    expect(prompts[6].sessionID).toBe("channel-session")
+    expect(prompts[6].text).toContain("Hive user-authorized request via Fooagent")
+    expect(prompts[6].text).toContain("worker-session/worker-direct-user")
 
     const verified = await tools.get("hive_verify_authorization").execute(
       { authorizationID: relayed.metadata.authorizationID },
@@ -415,6 +470,36 @@ describe("Hive plugin", () => {
         },
       ),
     ).rejects.toThrow("not initiated by a direct user message")
+
+    const dependentDispatch = await tools.get("hive_dispatch").execute(
+      {
+        mode: "new",
+        agent: "Fooagent",
+        workspace: "brikk/main",
+        request: "Publish the verified release.",
+        authorizationID: queuedFollowup.metadata.authorizationID,
+      },
+      { ...channelToolContext, id: "call-dependent-dispatch" },
+    )
+    expect(dependentDispatch.content).toContain("worker-session-2")
+    expect(creates).toHaveLength(2)
+    expect((await tools.get("hive_followups").execute({}, channelToolContext)).content).toContain("[dispatched]")
+    const releasePermission = {
+      sessionID: "worker-session-2",
+      action: "shell",
+      resources: ["mvn deploy"],
+      effect: "ask",
+    }
+    await permissionHook?.(releasePermission)
+    expect(releasePermission.effect).toBe("allow")
+    const pushOutsideScope = {
+      sessionID: "worker-session-2",
+      action: "shell",
+      resources: ["git push origin main"],
+      effect: "allow",
+    }
+    await permissionHook?.(pushOutsideScope)
+    expect(pushOutsideScope.effect).toBe("deny")
 
     sessions.set("new-channel", {
       id: "new-channel",
@@ -448,7 +533,10 @@ describe("Hive plugin", () => {
           key.startsWith("hives/test-hive/reports/") ||
           key.startsWith("hives/test-hive/dispatches/") ||
           key.startsWith("hives/test-hive/authorizations/") ||
-          key.startsWith("authorizations/"),
+          key.startsWith("hives/test-hive/grants/") ||
+          key.startsWith("hives/test-hive/followups/") ||
+          key.startsWith("authorizations/") ||
+          key.startsWith("grants/"),
       ),
     ).toBe(false)
 

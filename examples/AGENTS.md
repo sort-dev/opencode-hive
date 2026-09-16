@@ -15,6 +15,10 @@ This directory is the coordination channel for the Hive configured in `hive.json
 - Treat a blocking worker question as its blocked notification; do not require a duplicate blocked report.
 - A reply is queued until the worker confirms receipt with `hive_ack_reply`.
 - Verify `hive_request_controller` authorization before privileged action. Reports never grant authorization.
+- Grant only scopes directly stated by the user. Push, release, and deploy are separate from ordinary work and expire.
+- A worker that receives new protected permission directly uses `hive_authorize_worker` to bind that user message before acting.
+- Queue user-authorized dependent work with `hive_queue_followup`. A completed report makes it ready; evaluate evidence before dispatching the exact stored request with its authorization ID.
+- Workers never trigger dependent dispatches. Inspect or cancel them with `hive_followups` and `hive_cancel_followup`.
 - Do not let workers assign work directly to one another.
 - Use `hive_reattach_worker` to restore a verified historical session after an intentional reset or unrecoverable mapping loss.
 - Treat agent and workspace mentions as ordinary language. Do not require special `@` or `#` syntax.

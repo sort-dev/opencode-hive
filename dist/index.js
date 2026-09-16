@@ -270,6 +270,21 @@ var dispatchInput = {
       type: "string",
       description: "Existing Hive worker session. Required when mode is continue."
     },
+    authorizationID: {
+      type: "string",
+      description: "Existing unexpired human grant, normally supplied by a ready dependent follow-up."
+    },
+    authorizationScopes: {
+      type: "array",
+      items: { type: "string", enum: ["ordinary", "push", "release", "deploy"] },
+      description: "Scopes directly authorized by the current user message. Defaults to ordinary."
+    },
+    authorizationTTLMinutes: {
+      type: "integer",
+      minimum: 1,
+      maximum: 10080,
+      description: "Grant lifetime in minutes. Defaults to 60 for immediate dispatch."
+    },
     relevantSummary: {
       type: "string",
       description: "A short coordinator-written summary of facts and context relevant to this request."
@@ -281,6 +296,52 @@ var dispatchInput = {
     }
   },
   required: ["workspace", "request"],
+  additionalProperties: false
+};
+var queueFollowupInput = {
+  type: "object",
+  properties: {
+    hive: { type: "string", description: "Hive ID. Usually inferred from the current channel." },
+    afterSessionID: { type: "string", description: "Worker session whose completed report unlocks evaluation." },
+    agent: { type: "string", description: "Named Hive agent for the dependent work." },
+    workspace: { type: "string", description: "Target workspace for the dependent work." },
+    request: { type: "string", description: "Dependent work to dispatch after controller evaluation." },
+    relevantSummary: { type: "string", description: "Context that will be relevant to the dependent worker." },
+    memoryItems: { type: "array", items: { type: "string" }, description: "Relevant durable facts." },
+    authorizationScopes: {
+      type: "array",
+      items: { type: "string", enum: ["ordinary", "push", "release", "deploy"] },
+      description: "Scopes directly authorized for the dependent work. Defaults to ordinary."
+    },
+    authorizationTTLMinutes: {
+      type: "integer",
+      minimum: 1,
+      maximum: 43200,
+      description: "How long the future authorization remains valid. Defaults to seven days."
+    }
+  },
+  required: ["afterSessionID", "agent", "workspace", "request"],
+  additionalProperties: false
+};
+var followupsInput = {
+  type: "object",
+  properties: {
+    hive: { type: "string", description: "Hive ID. Usually inferred from the current channel." },
+    status: {
+      type: "string",
+      enum: ["pending", "ready", "dispatched", "cancelled", "expired"],
+      description: "Optional follow-up status filter."
+    }
+  },
+  additionalProperties: false
+};
+var cancelFollowupInput = {
+  type: "object",
+  properties: {
+    hive: { type: "string", description: "Hive ID. Usually inferred from the current channel." },
+    followupID: { type: "string", description: "Pending or ready follow-up to cancel." }
+  },
+  required: ["followupID"],
   additionalProperties: false
 };
 var consultSessionInput = {
@@ -342,6 +403,25 @@ var verifyAuthorizationInput = {
   required: ["authorizationID"],
   additionalProperties: false
 };
+var authorizeWorkerInput = {
+  type: "object",
+  properties: {
+    request: { type: "string", description: "Work the user directly authorized in this worker session." },
+    authorizationScopes: {
+      type: "array",
+      items: { type: "string", enum: ["ordinary", "push", "release", "deploy"] },
+      description: "Scopes explicitly supported by the current direct user message."
+    },
+    authorizationTTLMinutes: {
+      type: "integer",
+      minimum: 1,
+      maximum: 10080,
+      description: "Grant lifetime in minutes. Defaults to 60."
+    }
+  },
+  required: ["request", "authorizationScopes"],
+  additionalProperties: false
+};
 var recentStatusInput = {
   type: "object",
   properties: {
@@ -400,6 +480,12 @@ function authorizationKey(authorizationID) {
 function detachedWorkerKey(sessionID) {
   return `detached-workers/${sessionID}`;
 }
+function grantKey(grantID) {
+  return `grants/${grantID}`;
+}
+function followupKey(hiveID, followupID) {
+  return `hives/${hiveID}/followups/${followupID}`;
+}
 async function saveWorker(ctx, worker) {
   await ctx.storage.set(workerKey(worker.sessionID), { ...worker });
   await ctx.storage.set(`hives/${worker.hiveID}/workers/${worker.sessionID}`, { ...worker });
@@ -409,6 +495,78 @@ async function saveReport(ctx, report) {
     ...report
   });
 }
+async function saveGrant(ctx, grant) {
+  await ctx.storage.set(grantKey(grant.id), { ...grant });
+  await ctx.storage.set(`hives/${grant.hiveID}/grants/${grant.id}`, { ...grant });
+}
+function grantScopes(input) {
+  return [...new Set(["ordinary", ...input ?? []])];
+}
+function grantTTL(minutes, fallback, maximum) {
+  const value = minutes ?? fallback;
+  if (!Number.isInteger(value) || value < 1 || value > maximum) {
+    throw new Error(`authorizationTTLMinutes must be from 1 to ${maximum}`);
+  }
+  return value;
+}
+async function createHumanGrant(ctx, input, tool) {
+  const source = await initiatingDirectUserMessage(ctx, tool);
+  const sourceText = clamp(oneLine(source.text), 4000) ?? "";
+  const createdAt = Date.now();
+  const grant = {
+    id: `grant_${crypto.randomUUID().slice(0, 12)}`,
+    hiveID: input.hiveID,
+    purpose: input.purpose,
+    request: oneLine(input.request),
+    scopes: grantScopes(input.scopes),
+    sourceUserSessionID: tool.sessionID,
+    sourceUserMessageID: source.id,
+    sourceUserText: sourceText,
+    sourceUserTextHash: createHash("sha256").update(source.text).digest("hex"),
+    createdAt,
+    expiresAt: createdAt + input.ttlMinutes * 60000,
+    followupID: input.followupID
+  };
+  await saveGrant(ctx, grant);
+  return grant;
+}
+function requiredGrantScope(action, resources) {
+  const normalizedAction = action.toLowerCase();
+  const text2 = resources.join(`
+`).toLowerCase();
+  if (normalizedAction.includes("secret") || normalizedAction.includes("credential") || (normalizedAction === "read" || normalizedAction === "external_directory") && /(^|[/\\])\.env(?:\.|$)/.test(text2)) {
+    return "secret";
+  }
+  if (normalizedAction !== "shell")
+    return;
+  if (/\b(kubectl\s+(?:apply|delete|replace|patch)|pulumi\s+(?:up|destroy)|terraform\s+(?:apply|destroy))\b/.test(text2)) {
+    return "deploy";
+  }
+  if (/\b(mvn\s+deploy|npm\s+publish|cargo\s+publish|gh\s+release\s+create)\b/.test(text2) || /(?:^|\s)\.\/(?:mvnw|gradlew)\b.*\b(?:deploy|publish|publishtosonatype|closeandrelease)\b/.test(text2)) {
+    return "release";
+  }
+  if (/\b(git(?:\s+-C\s+\S+)?\s+push|gh\s+pr\s+merge|docker\s+push)\b/.test(text2))
+    return "push";
+  return;
+}
+var protectedPermissionRules = [
+  { action: "shell", resource: "*git push *", effect: "ask" },
+  { action: "shell", resource: "*gh pr merge *", effect: "ask" },
+  { action: "shell", resource: "*docker push *", effect: "ask" },
+  { action: "shell", resource: "*gh release create *", effect: "ask" },
+  { action: "shell", resource: "*mvn* deploy *", effect: "ask" },
+  { action: "shell", resource: "*gradlew *publish*", effect: "ask" },
+  { action: "shell", resource: "*publishToSonatype*", effect: "ask" },
+  { action: "shell", resource: "*closeAndRelease*", effect: "ask" },
+  { action: "shell", resource: "*npm publish *", effect: "ask" },
+  { action: "shell", resource: "*cargo publish *", effect: "ask" },
+  { action: "shell", resource: "*kubectl apply *", effect: "ask" },
+  { action: "shell", resource: "*kubectl delete *", effect: "ask" },
+  { action: "shell", resource: "*pulumi up *", effect: "ask" },
+  { action: "shell", resource: "*pulumi destroy *", effect: "ask" },
+  { action: "shell", resource: "*terraform apply *", effect: "ask" },
+  { action: "shell", resource: "*terraform destroy *", effect: "ask" }
+];
 function metadataString(metadata, key) {
   const value = metadata?.[key];
   return typeof value === "string" && value.length > 0 ? value : undefined;
@@ -497,7 +655,8 @@ async function recoverWorker(ctx, sessionID) {
     memoryItems: dispatch?.memoryItems ?? [],
     configPath: hive.configPath,
     permissionMode: "ask",
-    identityState: "recovered"
+    identityState: "recovered",
+    authorizationID: dispatch?.authorizationID
   };
   await saveWorker(ctx, worker);
   return worker;
@@ -591,7 +750,7 @@ async function initiatingDirectUserMessage(ctx, tool) {
   const beforeTool = assistantIndex === -1 ? messages : messages.slice(0, assistantIndex);
   const source = [...beforeTool].reverse().find(isUserMessage);
   if (!isDirectUserMessage(source)) {
-    throw new Error("The current worker turn was not initiated by a direct user message. Ask the user in this worker session or ask the Hive controller to obtain confirmation.");
+    throw new Error("The current turn was not initiated by a direct user message. Ask the user directly or obtain a valid existing human grant.");
   }
   return source;
 }
@@ -674,6 +833,68 @@ async function controllerHive(ctx, sessionID, requested) {
     throw new Error(`Only the registered Hive channel may do this for ${hive.id}`);
   return { hive, channel };
 }
+async function saveFollowup(ctx, followup) {
+  await ctx.storage.set(followupKey(followup.hiveID, followup.id), { ...followup });
+}
+async function readyFollowup(ctx, followup, evidence) {
+  if (followup.status !== "pending")
+    return;
+  const grant = await ctx.storage.get(grantKey(followup.authorizationID));
+  const channel = await ctx.storage.get(channelKey(followup.hiveID));
+  if (!grant || grant.expiresAt <= Date.now()) {
+    await saveFollowup(ctx, {
+      ...followup,
+      status: "expired",
+      readyAt: Date.now(),
+      evidenceReportAt: evidence.reportAt
+    });
+    if (channel) {
+      await ctx.session.prompt({
+        sessionID: channel.sessionID,
+        text: `Hive follow-up expired [${followup.id}] | Completion evidence: ${oneLine(evidence.summary)} | Ask the user to authorize the dependent work again.`,
+        delivery: "queue",
+        metadata: { hiveID: followup.hiveID, followupID: followup.id, followupStatus: "expired" }
+      });
+    }
+    return;
+  }
+  const updated = {
+    ...followup,
+    status: "ready",
+    readyAt: Date.now(),
+    evidenceReportAt: evidence.reportAt
+  };
+  await saveFollowup(ctx, updated);
+  if (!channel)
+    return;
+  await ctx.session.prompt({
+    sessionID: channel.sessionID,
+    text: [
+      `Hive follow-up ready [${followup.id}]`,
+      `Completion evidence: ${oneLine(evidence.summary)}`,
+      `Proposed: ${followup.agentName} in ${followup.projectName}/${followup.workspaceName}: ${oneLine(followup.request)}`,
+      `Human grant: ${followup.authorizationID}, expires ${new Date(grant.expiresAt).toISOString()}`,
+      "Evaluate the completion evidence. If it is sufficient, call hive_dispatch with this authorizationID and the stored target/request. Otherwise ask the user."
+    ].join(" | "),
+    delivery: "queue",
+    metadata: {
+      hiveID: followup.hiveID,
+      followupID: followup.id,
+      followupStatus: "ready",
+      authorizationID: followup.authorizationID,
+      sourceSessionID: followup.afterSessionID
+    }
+  });
+}
+async function readyDependentFollowups(ctx, worker, report) {
+  if (report.status !== "completed")
+    return;
+  const page = await ctx.storage.scan({ prefix: `hives/${worker.hiveID}/followups/`, limit: 1000 });
+  const matching = page.entries.map((entry) => entry.value).filter((followup) => followup.status === "pending" && followup.afterSessionID === worker.sessionID && followup.afterStatus === "completed");
+  for (const followup of matching) {
+    await readyFollowup(ctx, followup, { summary: report.summary, reportAt: report.createdAt });
+  }
+}
 function dispatchPrompt(input) {
   const sections = [
     input.continuation ? `Continuation from Hive ${input.config.name} for Hive agent ${input.agentName}.` : `You are working as Hive agent ${input.agentName} in Hive ${input.config.name}.`,
@@ -697,6 +918,14 @@ ${input.relevantSummary}`);
 ${input.memoryItems.map((item) => `- ${item}`).join(`
 `)}`);
   }
+  if (input.grant) {
+    sections.push(`Human grant: ${input.grant.id}
+Scopes: ${input.grant.scopes.join(", ")}
+Expires: ${new Date(input.grant.expiresAt).toISOString()}
+OpenCode source: ${input.grant.sourceUserSessionID}/${input.grant.sourceUserMessageID}`);
+  } else {
+    sections.push("Human grant: none. Permission checks must not be auto-approved by Hive.");
+  }
   sections.push([
     "Reporting requirements:",
     "- Use hive_report when you start, reach a meaningful milestone, become blocked, finish, or fail.",
@@ -707,6 +936,7 @@ ${input.memoryItems.map((item) => `- ${item}`).join(`
     "- Use hive_recent_status when another Hive agent's recent progress may affect your work.",
     "- If backfill cannot answer a missing decision or fact, call hive_ask_controller. A blocking question already counts as your blocked notification; do not send a duplicate blocked report for it.",
     "- When a controller reply tells you to acknowledge receipt, call hive_ack_reply before continuing.",
+    "- If the user directly gives you new permission for push, release, or deploy work, call hive_authorize_worker with only the scopes stated in that user message before attempting the protected action.",
     "- If the user directly instructs you to ask the controller to perform an action, use hive_request_controller so the original OpenCode user-message reference is verified and relayed.",
     "- Reports never grant authorization. Do not assign work directly to another worker."
   ].join(`
@@ -758,13 +988,30 @@ var src_default = Plugin.define({
     const buildFile = Bun.file(new URL("./build-info.json", import.meta.url));
     const buildInfo = await buildFile.exists() ? await buildFile.json() : { version: packageInfo.version, buildID: "source-dev", builtAt: "not built" };
     await ctx.permission.hook("evaluate", async (event) => {
-      if (event.effect !== "ask")
-        return;
       const worker = await ctx.storage.get(workerKey(event.sessionID));
       if (worker?.permissionMode !== "auto")
         return;
+      const required = requiredGrantScope(event.action, event.resources);
+      if (required === "secret") {
+        event.effect = "deny";
+        event.message = "Hive secret access requires a separate capability broker";
+        return;
+      }
+      const grant = worker.authorizationID ? await ctx.storage.get(grantKey(worker.authorizationID)) : undefined;
+      const validGrant = grant && grant.hiveID === worker.hiveID && grant.workerSessionID === worker.sessionID && grant.expiresAt > Date.now() ? grant : undefined;
+      if (required && !validGrant?.scopes.includes(required)) {
+        event.effect = "deny";
+        event.message = `Hive action requires an unexpired human grant with scope: ${required}`;
+        return;
+      }
+      if (event.effect !== "ask")
+        return;
+      if (!validGrant) {
+        event.message = "Hive did not auto-approve because no unexpired originating human dispatch grant is bound";
+        return;
+      }
       event.effect = "allow";
-      event.message = `Auto-approved by Hive ${worker.hiveID} for ${worker.agentName}`;
+      event.message = `Auto-approved by Hive grant ${validGrant.id} from ${validGrant.sourceUserSessionID}/${validGrant.sourceUserMessageID}`;
     });
     const createHiveSkillLocation = fileURLToPath(new URL("../skills/create-hive/SKILL.md", import.meta.url));
     const createHiveSkillSource = await Bun.file(createHiveSkillLocation).text();
@@ -856,6 +1103,15 @@ var src_default = Plugin.define({
               await ctx.storage.remove(entry.key);
               await ctx.storage.remove(authorizationKey(authorization.id));
             }
+            const grants = await ctx.storage.scan({ prefix: `hives/${hive.id}/grants/`, limit: 1000 });
+            for (const entry of grants.entries) {
+              const grant = entry.value;
+              await ctx.storage.remove(entry.key);
+              await ctx.storage.remove(grantKey(grant.id));
+            }
+            const followups = await ctx.storage.scan({ prefix: `hives/${hive.id}/followups/`, limit: 1000 });
+            for (const entry of followups.entries)
+              await ctx.storage.remove(entry.key);
           }
           await ctx.storage.set(channelKey(hive.id), { ...record });
           await ctx.storage.set(sourceChannelKey(tool.sessionID), { ...record });
@@ -884,6 +1140,8 @@ Session: ${tool.sessionID}`);
           const queuedReplies = hiveWorkers.filter((worker) => worker.pendingQuestion?.status === "reply-queued").length;
           const recoveredWorkers = hiveWorkers.filter((worker) => worker.identityState === "recovered").length;
           const detachedWorkers = await ctx.storage.scan({ prefix: `hives/${hive.id}/detached/`, limit: 1000 });
+          const followupPage = await ctx.storage.scan({ prefix: `hives/${hive.id}/followups/`, limit: 1000 });
+          const followups = followupPage.entries.map((entry) => entry.value);
           const workspaces = Object.entries(hive.projects).flatMap(([project, definition]) => definition.workspaces.map((workspace) => `- ${project}/${workspace.name}: ${workspace.directory} -> ${workspace.defaultAgent ?? "no default agent"}`));
           return text([
             `${hive.name} (${hive.id})`,
@@ -897,6 +1155,7 @@ Session: ${tool.sessionID}`);
             `Detached workers: ${detachedWorkers.entries.length}`,
             `Questions awaiting controller: ${pendingQuestions}`,
             `Replies awaiting worker receipt: ${queuedReplies}`,
+            `Dependent follow-ups: ${followups.filter((item) => item.status === "pending").length} pending, ${followups.filter((item) => item.status === "ready").length} ready`,
             "Workspaces:",
             ...workspaces
           ].join(`
@@ -975,6 +1234,98 @@ Open: ${openChamberLink(session.id, resolved.workspace.directory)}`);
         }
       });
       editor.add({
+        name: "queue_followup",
+        description: "Record user-authorized dependent work. A completed source report marks it ready, but the controller still evaluates evidence before dispatch.",
+        input: queueFollowupInput,
+        options: { namespace: "hive" },
+        execute: async (rawInput, tool) => {
+          const input = rawInput;
+          const { hive } = await controllerHive(ctx, tool.sessionID, input.hive);
+          const source = await workerForSession(ctx, input.afterSessionID);
+          if (source.hiveID !== hive.id)
+            throw new Error(`${source.sessionID} belongs to Hive ${source.hiveID}`);
+          if (!hive.agents[input.agent])
+            throw new Error(`Unknown Hive agent: ${input.agent}`);
+          const target = resolveWorkspace(hive, input.workspace);
+          await assertWorkspaceDirectory(target.workspace);
+          const followupID = `followup_${crypto.randomUUID().slice(0, 12)}`;
+          const grant = await createHumanGrant(ctx, {
+            hiveID: hive.id,
+            purpose: "followup",
+            request: input.request,
+            scopes: input.authorizationScopes,
+            ttlMinutes: grantTTL(input.authorizationTTLMinutes, 10080, 43200),
+            followupID
+          }, tool);
+          const followup = {
+            id: followupID,
+            hiveID: hive.id,
+            afterSessionID: source.sessionID,
+            afterStatus: "completed",
+            agentName: input.agent,
+            projectName: target.projectName,
+            workspaceName: target.workspace.name,
+            request: input.request,
+            relevantSummary: input.relevantSummary,
+            memoryItems: input.memoryItems ?? [],
+            authorizationID: grant.id,
+            status: "pending",
+            createdAt: Date.now()
+          };
+          await saveFollowup(ctx, followup);
+          if (source.lastStatus === "completed") {
+            const reports = await ctx.storage.scan({ prefix: `hives/${hive.id}/reports/`, limit: 1000 });
+            const evidence = reports.entries.map((entry) => entry.value).filter((report) => report.sessionID === source.sessionID && report.status === "completed").sort((left, right) => right.createdAt - left.createdAt)[0];
+            await readyFollowup(ctx, followup, {
+              summary: evidence?.summary ?? `${source.agentName} has a recorded completed status`,
+              reportAt: evidence?.createdAt ?? Date.now()
+            });
+          }
+          return text([
+            `Queued dependent follow-up ${followup.id}.`,
+            `After: ${source.agentName} session ${source.sessionID} reports completed`,
+            `Then evaluate: ${followup.agentName} in ${target.reference}: ${oneLine(followup.request)}`,
+            `Human grant: ${grant.id}, expires ${new Date(grant.expiresAt).toISOString()}`
+          ].join(`
+`), { hiveID: hive.id, followupID: followup.id, authorizationID: grant.id });
+        }
+      });
+      editor.add({
+        name: "followups",
+        description: "List dependent Hive follow-ups and whether they are pending, ready, dispatched, or cancelled.",
+        input: followupsInput,
+        options: { namespace: "hive" },
+        execute: async (rawInput, tool) => {
+          const input = rawInput;
+          const { hive } = await controllerHive(ctx, tool.sessionID, input.hive);
+          const page = await ctx.storage.scan({ prefix: `hives/${hive.id}/followups/`, limit: 1000 });
+          const followups = page.entries.map((entry) => entry.value).filter((followup) => !input.status || followup.status === input.status).sort((left, right) => right.createdAt - left.createdAt);
+          if (!followups.length)
+            return text(`No matching dependent follow-ups in ${hive.name}.`);
+          return text(followups.map((followup) => `- [${followup.status}] ${followup.id} | after ${followup.afterSessionID} ${followup.afterStatus} | ${followup.agentName} in ${followup.projectName}/${followup.workspaceName}: ${oneLine(followup.request)} | grant ${followup.authorizationID}`).join(`
+`));
+        }
+      });
+      editor.add({
+        name: "cancel_followup",
+        description: "Cancel a pending or ready dependent follow-up. This does not stop work already dispatched.",
+        input: cancelFollowupInput,
+        options: { namespace: "hive" },
+        execute: async (rawInput, tool) => {
+          const input = rawInput;
+          const { hive } = await controllerHive(ctx, tool.sessionID, input.hive);
+          const followup = await ctx.storage.get(followupKey(hive.id, input.followupID));
+          if (!followup)
+            throw new Error(`Unknown follow-up: ${input.followupID}`);
+          if (followup.status === "dispatched")
+            throw new Error(`${followup.id} was already dispatched`);
+          if (followup.status === "cancelled")
+            return text(`${followup.id} is already cancelled.`);
+          await saveFollowup(ctx, { ...followup, status: "cancelled" });
+          return text(`Cancelled dependent follow-up ${followup.id}.`);
+        }
+      });
+      editor.add({
         name: "dispatch",
         description: "Create a worker session for a named Hive agent in a configured workspace and send it work.",
         input: dispatchInput,
@@ -1011,11 +1362,52 @@ Open: ${openChamberLink(session.id, resolved.workspace.directory)}`);
           const dispatchID = crypto.randomUUID();
           const dispatchedAt = Date.now();
           const permissionMode = resolved.workspace.permissionMode ?? agent.permissionMode ?? hive.permissionMode;
+          let grant;
+          let grantCreatedForDispatch = false;
+          let grantedFollowup;
+          if (input.authorizationID) {
+            grant = await ctx.storage.get(grantKey(input.authorizationID));
+            if (!grant)
+              throw new Error(`Unknown human grant: ${input.authorizationID}`);
+            if (grant.hiveID !== hive.id)
+              throw new Error(`${grant.id} belongs to Hive ${grant.hiveID}`);
+            if (grant.expiresAt <= dispatchedAt)
+              throw new Error(`Human grant ${grant.id} has expired`);
+            if (grant.workerSessionID)
+              throw new Error(`Human grant ${grant.id} was already used`);
+            if (grant.followupID) {
+              grantedFollowup = await ctx.storage.get(followupKey(hive.id, grant.followupID));
+              if (!grantedFollowup || grantedFollowup.status !== "ready") {
+                throw new Error(`Follow-up ${grant.followupID} is not ready for dispatch`);
+              }
+              if (grantedFollowup.agentName !== agentName || grantedFollowup.projectName !== resolved.projectName || grantedFollowup.workspaceName !== resolved.workspace.name || oneLine(grantedFollowup.request) !== oneLine(input.request)) {
+                throw new Error(`Dispatch does not match authorized follow-up ${grantedFollowup.id}`);
+              }
+            }
+          } else {
+            try {
+              grant = await createHumanGrant(ctx, {
+                hiveID: hive.id,
+                purpose: "dispatch",
+                request: input.request,
+                scopes: input.authorizationScopes,
+                ttlMinutes: grantTTL(input.authorizationTTLMinutes, 60, 10080)
+              }, tool);
+              grantCreatedForDispatch = true;
+            } catch (error) {
+              if (!(error instanceof Error) || !error.message.startsWith("The current turn was not initiated")) {
+                throw error;
+              }
+            }
+          }
+          const relevantSummary = grantedFollowup?.relevantSummary ?? input.relevantSummary;
+          const memoryItems = grantedFollowup?.memoryItems ?? input.memoryItems ?? [];
           const session = previous ? await ctx.session.get({ sessionID: previous.sessionID }) : await ctx.session.create({
             title: `${agentName}: ${shorten(input.request, 72)}`,
             agent: agent.openCodeAgent,
             model: modelRef(agent.model),
             location: { directory: resolved.workspace.directory },
+            permissions: protectedPermissionRules,
             metadata: {
               hiveID: hive.id,
               hiveAgent: agentName,
@@ -1024,7 +1416,8 @@ Open: ${openChamberLink(session.id, resolved.workspace.directory)}`);
               hiveChannelSessionID: tool.sessionID,
               hiveChannelDirectory: channel.directory,
               hiveConfigPath: hive.configPath,
-              hivePermissionMode: permissionMode
+              hivePermissionMode: permissionMode,
+              ...grant ? { hiveAuthorizationID: grant.id } : {}
             }
           });
           if (session.location.directory !== resolved.workspace.directory) {
@@ -1036,11 +1429,12 @@ Open: ${openChamberLink(session.id, resolved.workspace.directory)}`);
             channelDirectory: channel.directory,
             dispatchID,
             request: input.request,
-            relevantSummary: input.relevantSummary,
-            memoryItems: input.memoryItems ?? [],
+            relevantSummary,
+            memoryItems,
             configPath: hive.configPath,
             permissionMode,
             identityState: "active",
+            authorizationID: grant?.id,
             lastDispatchAt: dispatchedAt,
             dispatchCount: (previous.dispatchCount ?? 1) + 1,
             pendingQuestion: undefined
@@ -1058,11 +1452,12 @@ Open: ${openChamberLink(session.id, resolved.workspace.directory)}`);
             lastDispatchAt: dispatchedAt,
             dispatchCount: 1,
             request: input.request,
-            relevantSummary: input.relevantSummary,
-            memoryItems: input.memoryItems ?? [],
+            relevantSummary,
+            memoryItems,
             configPath: hive.configPath,
             permissionMode,
-            identityState: "active"
+            identityState: "active",
+            authorizationID: grant?.id
           };
           const dispatch = {
             hiveID: hive.id,
@@ -1073,10 +1468,15 @@ Open: ${openChamberLink(session.id, resolved.workspace.directory)}`);
             projectName: resolved.projectName,
             workspaceName: resolved.workspace.name,
             request: input.request,
-            relevantSummary: input.relevantSummary,
-            memoryItems: input.memoryItems ?? [],
-            createdAt: dispatchedAt
+            relevantSummary,
+            memoryItems,
+            createdAt: dispatchedAt,
+            authorizationID: grant?.id
           };
+          if (grant) {
+            grant = { ...grant, workerSessionID: session.id, usedAt: dispatchedAt };
+            await saveGrant(ctx, grant);
+          }
           await saveWorker(ctx, record);
           await ctx.storage.set(dispatchKey(hive.id, dispatchID), { ...dispatch });
           try {
@@ -1091,11 +1491,12 @@ Open: ${openChamberLink(session.id, resolved.workspace.directory)}`);
                 workspaceDirectory: resolved.workspace.directory,
                 branch: resolved.workspace.branch,
                 request: input.request,
-                relevantSummary: input.relevantSummary,
-                memoryItems: input.memoryItems,
+                relevantSummary,
+                memoryItems,
                 dispatchID,
                 channelSessionID: tool.sessionID,
-                continuation: mode === "continue"
+                continuation: mode === "continue",
+                grant
               }),
               delivery: "queue",
               metadata: {
@@ -1103,11 +1504,23 @@ Open: ${openChamberLink(session.id, resolved.workspace.directory)}`);
                 hiveAgent: agentName,
                 hiveDispatchID: dispatchID,
                 hiveDispatchMode: mode,
+                ...grant ? { hiveAuthorizationID: grant.id } : {},
                 sourceSessionID: tool.sessionID
               }
             });
           } catch (error) {
             await ctx.storage.remove(dispatchKey(hive.id, dispatchID));
+            if (grant) {
+              if (grantCreatedForDispatch) {
+                await ctx.storage.remove(grantKey(grant.id));
+                await ctx.storage.remove(`hives/${hive.id}/grants/${grant.id}`);
+              } else {
+                const restored = { ...grant };
+                delete restored.workerSessionID;
+                delete restored.usedAt;
+                await saveGrant(ctx, restored);
+              }
+            }
             if (previous)
               await saveWorker(ctx, previous);
             else {
@@ -1116,12 +1529,25 @@ Open: ${openChamberLink(session.id, resolved.workspace.directory)}`);
             }
             throw error;
           }
+          if (grantedFollowup) {
+            await saveFollowup(ctx, {
+              ...grantedFollowup,
+              status: "dispatched",
+              workerSessionID: session.id
+            });
+          }
           return text([
             `${mode === "continue" ? "Continued" : "Dispatched"} ${agentName} in ${resolved.reference}.`,
             `Worker session: ${session.id}`,
             `Open: ${openChamberLink(session.id, resolved.workspace.directory)}`
           ].join(`
-`), { hiveID: hive.id, dispatchID, dispatchMode: mode, workerSessionID: session.id });
+`), {
+            hiveID: hive.id,
+            dispatchID,
+            dispatchMode: mode,
+            workerSessionID: session.id,
+            ...grant ? { authorizationID: grant.id, authorizationExpiresAt: grant.expiresAt } : {}
+          });
         }
       });
       editor.add({
@@ -1404,6 +1830,31 @@ ${markdown}` : undefined
         }
       });
       editor.add({
+        name: "authorize_worker",
+        description: "Bind the current direct OpenCode user message to this worker with explicit expiring ordinary, push, release, or deploy scopes.",
+        input: authorizeWorkerInput,
+        options: { namespace: "hive" },
+        execute: async (rawInput, tool) => {
+          const input = rawInput;
+          const worker = await workerForSession(ctx, tool.sessionID);
+          const grant = await createHumanGrant(ctx, {
+            hiveID: worker.hiveID,
+            purpose: "dispatch",
+            request: input.request,
+            scopes: input.authorizationScopes,
+            ttlMinutes: grantTTL(input.authorizationTTLMinutes, 60, 10080)
+          }, tool);
+          const bound = { ...grant, workerSessionID: worker.sessionID, usedAt: Date.now() };
+          await saveGrant(ctx, bound);
+          await saveWorker(ctx, { ...worker, authorizationID: bound.id });
+          return text(`Bound human grant ${bound.id} to ${worker.agentName}. Scopes: ${bound.scopes.join(", ")}. Expires: ${new Date(bound.expiresAt).toISOString()}. OpenCode source: ${bound.sourceUserSessionID}/${bound.sourceUserMessageID}.`, {
+            hiveID: worker.hiveID,
+            authorizationID: bound.id,
+            authorizationExpiresAt: bound.expiresAt
+          });
+        }
+      });
+      editor.add({
         name: "request_controller",
         description: "Relay an action the user directly requested in this worker session to the Hive controller with a verified OpenCode user-message reference.",
         input: requestControllerInput,
@@ -1534,9 +1985,11 @@ ${markdown}` : undefined
               hiveDispatchID: record.dispatchID,
               sourceSessionID: tool.sessionID,
               sourceMessageID: tool.messageID,
-              reportStatus: input.status
+              reportStatus: input.status,
+              ...record.authorizationID ? { hiveAuthorizationID: record.authorizationID } : {}
             }
           });
+          await readyDependentFollowups(ctx, record, report);
           return text(`Reported ${input.status} to Hive ${record.hiveID}.`);
         }
       });
@@ -1572,4 +2025,4 @@ export {
   src_default as default
 };
 
-//# debugId=2F1C8433A64D35E364756E2164756E21
+//# debugId=08B458794FE263CE64756E2164756E21

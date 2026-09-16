@@ -15,6 +15,8 @@
   controller requests backed by direct OpenCode user-message references.
 - Worker recovery from session metadata, explicit reattachment, reset
   tombstones, and compare-and-swap channel replacement.
+- Expiring human dispatch grants, protected push/release/deploy scopes, and
+  controller-evaluated dependent follow-ups.
 - Standalone and embedded Hive model documented.
 - Parent and child Hive federation model documented.
 - Verified build artifact with build identity and server diagnostics in
@@ -42,8 +44,6 @@ working in one checkout.
    automatic cross-Hive delegation yet.
 4. Strengthen controller instructions for source links, deduplication,
    corrections, stale-status markers, and completed-work archiving.
-5. Bind general worker auto-approval to originating human dispatch grants rather
-   than trusting worker membership alone.
 
 ## Environment and secret work after guidance
 

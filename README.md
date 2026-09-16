@@ -18,6 +18,8 @@ The current spike supports:
 - Worker questions, controller replies, and recent report lookup
 - Worker reply receipts and verified user-authorized requests to the controller
 - Worker identity recovery, explicit reattachment, reset tombstones, and compare-and-swap channel replacement
+- Expiring human dispatch grants with separate ordinary, push, release, and deploy scopes
+- Controller-evaluated dependent follow-ups backed by their originating user grant
 - Hive, agent, and workspace permission modes for launched workers
 - Progress reports routed back to the Hive channel
 - Durable worker-to-Hive mappings
@@ -64,6 +66,12 @@ The OpenChamber V2 preview also writes an `opencode.managed.json` file. In previ
 8. The worker acknowledges receipt with `hive_ack_reply`. Direct user instructions relayed from a worker use `hive_request_controller` and retain their OpenCode message reference.
 
 When replacing a channel, pass both `replace: true` and the currently registered channel as `expectedChannelSessionID`. An intentional `clearHistory` reset detaches workers without deleting their OpenCode sessions. Detached sessions do not silently recover; restore one with `hive_reattach_worker` after verifying its agent and workspace. Automatically reconstructed workers use `ask` permissions until the controller explicitly continues or reattaches them.
+
+Hive auto-approval is active only while a worker has an unexpired grant derived from the direct user message that initiated its dispatch. Ordinary work does not imply permission to push, release, or deploy. Those operations require an explicit matching scope. Secret access is never covered by general worker auto-approval.
+
+If the user grants new protected permission while speaking directly to a worker, the worker calls `hive_authorize_worker`. Hive verifies the current OpenCode user message, binds the requested scopes to that worker, and records an expiration. The tool does not infer or widen scopes beyond what the worker requests from the direct message.
+
+Dependent work uses `hive_queue_followup`. A completed source report changes the follow-up from `pending` to `ready` and notifies the controller. It does not dispatch the dependent worker. The controller evaluates completion evidence and, if sufficient, calls `hive_dispatch` with the stored `authorizationID`, target, and exact request.
 
 Special mention syntax is not required. Ordinary phrasing is enough as long as the coordinator resolves it to the typed dispatch tool.
 

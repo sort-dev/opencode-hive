@@ -75,6 +75,9 @@ This directory is the coordination and progress channel for the Hive in `hive.js
 - Reports and worker assertions never grant authorization.
 - Workers do not assign work directly to other workers.
 - Channel replacement names the expected current channel ID, and detached historical workers require explicit reattachment.
+- Auto-approval requires an unexpired human dispatch grant. Push, release, and deploy require separate explicit scopes; secrets remain outside general auto-approval.
+- Direct protected permission given inside a worker session is bound with `hive_authorize_worker` before action.
+- `hive_queue_followup` records dependent work from a direct user message. Completion marks it ready, but only the controller evaluates evidence and dispatches it.
 - Keep `PLAN.md`, `TODO.md`, and `PROGRESS.md` current.
 - Do not include secret values in prompts, reports, or files.
 ```

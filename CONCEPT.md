@@ -421,6 +421,30 @@ Not every event must trigger an immediate scribe turn.
 V2's durable queue allows several reports to wait while the scribe is busy. A
 later policy may coalesce a burst into one turn.
 
+## Dependent Follow-ups
+
+A human may authorize future work that depends on another worker completing,
+for example: "When Brikk finishes the release, have Doris build against it."
+
+Hive stores:
+
+- The source worker session and required status.
+- The dependent agent, workspace, request, relevant summary, and memory items.
+- The originating OpenCode user-message reference.
+- An expiring human grant and its permission scopes.
+- Pending, ready, dispatched, cancelled, or expired state.
+
+The source worker never dispatches the dependent work. Its completed report
+changes a matching follow-up from pending to ready and notifies the controller.
+The controller evaluates the completion evidence. If sufficient, it dispatches
+the exact stored target and request using the original unexpired grant. If the
+evidence is weak, the grant expired, or the requested action changed, the
+controller asks the human again.
+
+Retries use the same follow-up ID. A grant binds to one worker session and later
+uses are rejected. The binding must become atomic before concurrent controllers
+are supported.
+
 ## Handoffs
 
 ### Same-System Handoff
@@ -692,6 +716,24 @@ source agent + target agent + project + intent -> allow | ask | deny
 
 OpenCode V2 permission evaluation hooks can enforce this immediately before an
 action runs or a permission request is shown.
+
+Worker auto-approval requires an unexpired grant derived from the direct user
+message that initiated the dispatch. Hive membership alone is insufficient.
+The initial scopes are `ordinary`, `push`, `release`, and `deploy`. Ordinary
+scope is always present; the others must be explicitly supported by the user
+message and expire with the grant. Secret access is never included in general
+worker auto-approval.
+
+Hive installs ask rules for known push, release, and deployment commands and
+checks both initially allowed and ask decisions in the permission hook. A
+protected action without the matching grant scope is denied rather than left to
+client auto-accept behavior.
+
+When a human grants new protected permission while speaking directly in a
+worker session, the worker may bind that current OpenCode user message through
+an authorization tool. The tool records only the requested scopes and expiry;
+it does not treat an older user message or a Hive-generated continuation as
+authority.
 
 ## Session Environments
 
