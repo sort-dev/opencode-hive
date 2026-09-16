@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "id": "release-team",
+  "name": "Release Team",
+  "permissionMode": "ask",
+  "channel": {
+    "defaultAgent": "scribe",
+    "contextMessages": 12
+  },
+  "agents": {
+    "scribe": {
+      "openCodeAgent": "build",
+      "instructions": "Track plans, TODOs, decisions, and worker progress."
+    },
+    "Fooagent": {
+      "openCodeAgent": "build",
+      "instructions": "Own releases and repository integration."
+    }
+  },
+  "projects": {
+    "brikk-house": {
+      "defaultWorkspace": "main",
+      "workspaces": [
+        {
+          "name": "main",
+          "directory": "/absolute/path/to/brikk-house",
+          "branch": "main",
+          "defaultAgent": "Fooagent",
+          "aliases": ["release"]
+        }
+      ]
+    }
+  }
+}
