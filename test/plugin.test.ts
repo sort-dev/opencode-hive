@@ -130,7 +130,12 @@ describe("Hive plugin", () => {
         ] : workerContextMessages,
         create: async (input: Record<string, any>) => {
           creates.push(input)
-          const session = { id: "worker-session", location: input.location }
+          const session = {
+            id: "worker-session",
+            location: input.location,
+            metadata: input.metadata,
+            time: { created: Date.now(), updated: Date.now() },
+          }
           sessions.set(session.id, session)
           return session
         },
@@ -158,6 +163,7 @@ describe("Hive plugin", () => {
     expect([...tools.keys()]).toEqual([
       "hive_init",
       "hive_status",
+      "hive_reattach_worker",
       "hive_dispatch",
       "hive_consult_session",
       "hive_recent_status",
@@ -200,6 +206,10 @@ describe("Hive plugin", () => {
     expect(prompts[0].text).not.toContain("Recent Hive channel context")
     expect(dispatchResult.content).toContain("worker-session")
 
+    storage.delete("workers/worker-session")
+    storage.delete("hives/test-hive/workers/worker-session")
+    expect(storage.has("workers/worker-session")).toBe(false)
+
     const consultation = await tools.get("hive_consult_session").execute(
       {
         sessionID: "worker-session",
@@ -210,6 +220,10 @@ describe("Hive plugin", () => {
     expect(generations).toHaveLength(1)
     expect(generations[0].sessionID).toBe("worker-session")
     expect(consultation.content).toContain("CONTINUE")
+    expect(storage.has("workers/worker-session")).toBe(true)
+    expect(
+      (storage.get("workers/worker-session") as { identityState: string; permissionMode: string }),
+    ).toMatchObject({ identityState: "recovered", permissionMode: "ask" })
 
     const continuation = await tools.get("hive_dispatch").execute(
       {
@@ -227,6 +241,9 @@ describe("Hive plugin", () => {
     expect(prompts[1].text).toContain("Continuation from Hive Test Hive")
     expect(continuation.content).toContain("Continued Fooagent")
     expect((storage.get("workers/worker-session") as { dispatchCount: number }).dispatchCount).toBe(2)
+    expect(
+      (storage.get("workers/worker-session") as { identityState: string; permissionMode: string }),
+    ).toMatchObject({ identityState: "active", permissionMode: "auto" })
 
     const workerPermission = {
       sessionID: "worker-session",
@@ -399,13 +416,21 @@ describe("Hive plugin", () => {
       ),
     ).rejects.toThrow("not initiated by a direct user message")
 
-    sessions.set("new-channel", { id: "new-channel", location: { directory: hiveDirectory } })
+    sessions.set("new-channel", {
+      id: "new-channel",
+      location: { directory: hiveDirectory },
+      time: { created: Date.now(), updated: Date.now() },
+    })
     await expect(
       tools.get("hive_init").execute({}, { ...channelToolContext, sessionID: "new-channel" }),
     ).rejects.toThrow("already registered")
-    await tools
-      .get("hive_init")
-      .execute({ replace: true }, { ...channelToolContext, sessionID: "new-channel" })
+    await expect(
+      tools.get("hive_init").execute({ replace: true }, { ...channelToolContext, sessionID: "new-channel" }),
+    ).rejects.toThrow("expectedChannelSessionID")
+    await tools.get("hive_init").execute(
+      { replace: true, expectedChannelSessionID: "channel-session" },
+      { ...channelToolContext, sessionID: "new-channel" },
+    )
     expect((storage.get("channels/test-hive") as { sessionID: string }).sessionID).toBe("new-channel")
     expect(storage.has("channel-sessions/channel-session")).toBe(false)
     expect((storage.get("workers/worker-session") as { channelSessionID: string }).channelSessionID).toBe(
@@ -415,6 +440,7 @@ describe("Hive plugin", () => {
       .get("hive_init")
       .execute({ replace: true, clearHistory: true }, { ...channelToolContext, sessionID: "new-channel" })
     expect(storage.has("workers/worker-session")).toBe(false)
+    expect(storage.has("detached-workers/worker-session")).toBe(true)
     expect(
       [...storage.keys()].some(
         (key) =>
@@ -425,5 +451,32 @@ describe("Hive plugin", () => {
           key.startsWith("authorizations/"),
       ),
     ).toBe(false)
+
+    await expect(
+      tools.get("hive_report").execute(
+        { status: "completed", summary: "This detached worker should not resurrect itself." },
+        {
+          sessionID: "worker-session",
+          agent: "build",
+          messageID: "detached-report-message",
+          id: "call-detached-report",
+          progress: async () => undefined,
+        },
+      ),
+    ).rejects.toThrow("intentionally detached")
+
+    const detachedSessions = await tools
+      .get("hive_sessions")
+      .execute({}, { ...channelToolContext, sessionID: "new-channel" })
+    expect(detachedSessions.content).toContain("Detached historical sessions")
+    expect(detachedSessions.content).toContain("worker-session")
+
+    await tools.get("hive_reattach_worker").execute(
+      { sessionID: "worker-session", agent: "Fooagent", workspace: "brikk/main" },
+      { ...channelToolContext, sessionID: "new-channel", id: "call-reattach" },
+    )
+    expect(storage.has("workers/worker-session")).toBe(true)
+    expect(storage.has("detached-workers/worker-session")).toBe(false)
+    expect(synthetics.at(-1)?.text).toContain("Reattached to Hive Test Hive")
   })
 })

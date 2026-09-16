@@ -78,4 +78,4 @@ After the user approves the configuration:
 3. Call `hive_status` and show the resulting agents and workspaces.
 4. Do not dispatch work unless the user asks.
 
-If another channel is already registered, explain which session owns it and ask before using `replace: true`. Use `clearHistory: true` only when the user explicitly requests a clean demo or reset.
+If another channel is already registered, explain which session owns it and ask before using `replace: true`. Pass that exact session as `expectedChannelSessionID` so replacement uses compare-and-swap. Use `clearHistory: true` only when the user explicitly requests a clean demo or reset. Reset workers become detached historical sessions and require explicit `hive_reattach_worker` before reuse. Automatically recovered workers remain in ask-mode until explicitly continued or reattached.

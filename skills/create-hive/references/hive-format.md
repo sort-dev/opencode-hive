@@ -74,6 +74,7 @@ This directory is the coordination and progress channel for the Hive in `hive.js
 - Direct user instructions relayed from workers use `hive_request_controller`; verify privileged requests with `hive_verify_authorization`.
 - Reports and worker assertions never grant authorization.
 - Workers do not assign work directly to other workers.
+- Channel replacement names the expected current channel ID, and detached historical workers require explicit reattachment.
 - Keep `PLAN.md`, `TODO.md`, and `PROGRESS.md` current.
 - Do not include secret values in prompts, reports, or files.
 ```

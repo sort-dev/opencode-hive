@@ -984,6 +984,14 @@ message-level cold-start deep-link contract is future work.
 - The scribe never deletes source reports while merging memory.
 - Only one automatic writer edits curated global memory.
 - Session and topic mappings survive process restart.
+- Missing worker mappings may be reconstructed from authoritative session
+  metadata when the session was not intentionally detached.
+- Reconstructed workers fall back to ask-mode permissions until the controller
+  explicitly continues or reattaches them.
+- Intentional resets leave a tombstone so old sessions do not silently
+  resurrect as active workers.
+- Replacing a registered Hive channel uses compare-and-swap against the expected
+  current channel ID.
 - Context and report sizes are bounded.
 - Delegation loops are detected and capped.
 

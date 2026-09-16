@@ -225,8 +225,23 @@ var initInput = {
     clearHistory: {
       type: "boolean",
       description: "Forget indexed workers and reports without deleting their OpenCode sessions."
+    },
+    expectedChannelSessionID: {
+      type: "string",
+      description: "Current registered channel ID. Required when replacing another channel."
     }
   },
+  additionalProperties: false
+};
+var reattachWorkerInput = {
+  type: "object",
+  properties: {
+    hive: { type: "string", description: "Hive ID. Usually inferred from the current channel." },
+    sessionID: { type: "string", description: "Existing OpenCode session to reattach as a Hive worker." },
+    agent: { type: "string", description: "Named Hive agent that owns the session." },
+    workspace: { type: "string", description: "Configured workspace that matches the session directory." }
+  },
+  required: ["sessionID", "agent", "workspace"],
   additionalProperties: false
 };
 var statusInput = {
@@ -382,6 +397,9 @@ function dispatchKey(hiveID, dispatchID) {
 function authorizationKey(authorizationID) {
   return `authorizations/${authorizationID}`;
 }
+function detachedWorkerKey(sessionID) {
+  return `detached-workers/${sessionID}`;
+}
 async function saveWorker(ctx, worker) {
   await ctx.storage.set(workerKey(worker.sessionID), { ...worker });
   await ctx.storage.set(`hives/${worker.hiveID}/workers/${worker.sessionID}`, { ...worker });
@@ -390,6 +408,103 @@ async function saveReport(ctx, report) {
   await ctx.storage.set(`hives/${report.hiveID}/reports/${report.createdAt}-${crypto.randomUUID()}`, {
     ...report
   });
+}
+function metadataString(metadata, key) {
+  const value = metadata?.[key];
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+async function recoverWorker(ctx, sessionID) {
+  const detached = await ctx.storage.get(detachedWorkerKey(sessionID));
+  if (detached) {
+    throw new Error(`Session ${sessionID} was intentionally detached by clearHistory. Use hive_reattach_worker from the Hive channel to restore it.`);
+  }
+  const session = await ctx.session.get({ sessionID });
+  const metadata = session.metadata;
+  const hiveID = metadataString(metadata, "hiveID");
+  const agentName = metadataString(metadata, "hiveAgent");
+  const workspaceReference = metadataString(metadata, "hiveWorkspace");
+  const dispatchID = metadataString(metadata, "hiveDispatchID");
+  if (!hiveID || !agentName || !workspaceReference || !dispatchID) {
+    throw new Error("This session has no recoverable Hive worker identity");
+  }
+  const configPath = metadataString(metadata, "hiveConfigPath");
+  let channel = await ctx.storage.get(channelKey(hiveID));
+  if (!channel) {
+    const channelSessionID = metadataString(metadata, "hiveChannelSessionID");
+    if (!channelSessionID)
+      throw new Error(`Hive ${hiveID} has no registered channel`);
+    const channelSession = await ctx.session.get({ sessionID: channelSessionID });
+    channel = {
+      hiveID,
+      sessionID: channelSessionID,
+      directory: channelSession.location.directory,
+      configPath
+    };
+  }
+  let hive;
+  if (configPath) {
+    try {
+      const candidate = await loadHiveConfig(configPath);
+      if (candidate.id === hiveID)
+        hive = candidate;
+    } catch {}
+  }
+  if (!hive && channel.configPath) {
+    try {
+      const candidate = await loadHiveConfig(channel.configPath);
+      if (candidate.id === hiveID)
+        hive = candidate;
+    } catch {}
+  }
+  if (!hive) {
+    const paths = await discoverHiveConfigPaths(channel.directory, channel.directory);
+    if (paths.length === 1) {
+      const candidate = await loadHiveConfig(paths[0]);
+      if (candidate.id === hiveID)
+        hive = candidate;
+    }
+  }
+  if (!hive) {
+    const candidates = await configuredHives(ctx);
+    hive = candidates.find((candidate) => candidate.id === hiveID);
+  }
+  if (!hive)
+    throw new Error(`Cannot recover ${sessionID}: Hive config ${hiveID} is unavailable`);
+  const resolved = resolveWorkspace(hive, workspaceReference);
+  if (!hive.agents[agentName])
+    throw new Error(`Cannot recover ${sessionID}: unknown Hive agent ${agentName}`);
+  if (session.location.directory !== resolved.workspace.directory) {
+    throw new Error(`Cannot recover ${sessionID}: session is in ${session.location.directory}, not ${resolved.workspace.directory}`);
+  }
+  const dispatches = await ctx.storage.scan({ prefix: `hives/${hiveID}/dispatches/`, limit: 1000 });
+  const matchingDispatches = dispatches.entries.map((entry) => entry.value).filter((entry) => entry.sessionID === sessionID).sort((left, right) => right.createdAt - left.createdAt);
+  const dispatch = matchingDispatches[0];
+  const worker = {
+    hiveID,
+    sessionID,
+    channelSessionID: channel.sessionID,
+    channelDirectory: channel.directory,
+    agentName,
+    projectName: resolved.projectName,
+    workspaceName: resolved.workspace.name,
+    workspaceDirectory: resolved.workspace.directory,
+    dispatchID: dispatch?.dispatchID ?? dispatchID,
+    createdAt: session.time.created,
+    lastDispatchAt: dispatch?.createdAt ?? session.time.created,
+    dispatchCount: Math.max(1, matchingDispatches.length),
+    request: dispatch?.request,
+    relevantSummary: dispatch?.relevantSummary,
+    memoryItems: dispatch?.memoryItems ?? [],
+    configPath: hive.configPath,
+    permissionMode: "ask",
+    identityState: "recovered"
+  };
+  await saveWorker(ctx, worker);
+  return worker;
+}
+async function workerForSession(ctx, sessionID) {
+  const worker = await ctx.storage.get(workerKey(sessionID));
+  return worker ?? recoverWorker(ctx, sessionID);
 }
 function modelRef(model) {
   if (!model)
@@ -684,10 +799,16 @@ var src_default = Plugin.define({
           if (previous && previous.sessionID !== tool.sessionID && !input.replace) {
             throw new Error(`Hive ${hive.id} is already registered to session ${previous.sessionID}`);
           }
+          if (previous && previous.sessionID !== tool.sessionID && input.replace && input.expectedChannelSessionID !== previous.sessionID) {
+            throw new Error(`Channel replacement conflict: expected ${previous.sessionID}. Pass expectedChannelSessionID with the current channel ID.`);
+          }
           const record = {
             hiveID: hive.id,
             sessionID: tool.sessionID,
-            directory: session.location.directory
+            directory: session.location.directory,
+            registeredAt: Date.now(),
+            sourceToolMessageID: tool.messageID,
+            configPath: hive.configPath
           };
           if (previous && previous.sessionID !== tool.sessionID) {
             await ctx.storage.remove(sourceChannelKey(previous.sessionID));
@@ -709,6 +830,14 @@ var src_default = Plugin.define({
             const workers = await ctx.storage.scan({ prefix: `hives/${hive.id}/workers/`, limit: 1000 });
             for (const entry of workers.entries) {
               const worker = entry.value;
+              const detached = {
+                hiveID: hive.id,
+                sessionID: worker.sessionID,
+                detachedAt: Date.now(),
+                reason: "clear-history"
+              };
+              await ctx.storage.set(detachedWorkerKey(worker.sessionID), { ...detached });
+              await ctx.storage.set(`hives/${hive.id}/detached/${worker.sessionID}`, { ...detached });
               await ctx.storage.remove(entry.key);
               await ctx.storage.remove(workerKey(worker.sessionID));
             }
@@ -730,6 +859,10 @@ var src_default = Plugin.define({
           }
           await ctx.storage.set(channelKey(hive.id), { ...record });
           await ctx.storage.set(sourceChannelKey(tool.sessionID), { ...record });
+          await ctx.storage.set(`hives/${hive.id}/channels/${record.registeredAt}-${tool.sessionID}`, {
+            ...record,
+            previousSessionID: previous?.sessionID ?? null
+          });
           return text(`Registered ${hive.name} channel.
 Session: ${tool.sessionID}`);
         }
@@ -749,20 +882,96 @@ Session: ${tool.sessionID}`);
           const workerCount = hiveWorkers.length;
           const pendingQuestions = hiveWorkers.filter((worker) => worker.pendingQuestion?.status === "awaiting-controller").length;
           const queuedReplies = hiveWorkers.filter((worker) => worker.pendingQuestion?.status === "reply-queued").length;
+          const recoveredWorkers = hiveWorkers.filter((worker) => worker.identityState === "recovered").length;
+          const detachedWorkers = await ctx.storage.scan({ prefix: `hives/${hive.id}/detached/`, limit: 1000 });
           const workspaces = Object.entries(hive.projects).flatMap(([project, definition]) => definition.workspaces.map((workspace) => `- ${project}/${workspace.name}: ${workspace.directory} -> ${workspace.defaultAgent ?? "no default agent"}`));
           return text([
             `${hive.name} (${hive.id})`,
             `Hive plugin: ${buildInfo.version} (${buildInfo.buildID}, built ${buildInfo.builtAt})`,
             `OpenCode: ${ctx.app.name} ${ctx.app.version} (${ctx.app.channel}), server pid ${process.pid}`,
             `Channel: ${channel?.sessionID ?? "not registered"}`,
+            channel?.registeredAt ? `Channel registered: ${new Date(channel.registeredAt).toISOString()}` : "Channel registered: unknown",
             `Agents: ${Object.keys(hive.agents).join(", ")}`,
             `Workers: ${workerCount}`,
+            `Recovered workers awaiting reattach or continuation: ${recoveredWorkers}`,
+            `Detached workers: ${detachedWorkers.entries.length}`,
             `Questions awaiting controller: ${pendingQuestions}`,
             `Replies awaiting worker receipt: ${queuedReplies}`,
             "Workspaces:",
             ...workspaces
           ].join(`
 `));
+        }
+      });
+      editor.add({
+        name: "reattach_worker",
+        description: "Explicitly restore an existing OpenCode session as a Hive worker after a reset or missing mapping. The session directory, Hive metadata, agent, and workspace are validated.",
+        input: reattachWorkerInput,
+        options: { namespace: "hive" },
+        execute: async (rawInput, tool) => {
+          const input = rawInput;
+          const { hive, channel } = await controllerHive(ctx, tool.sessionID, input.hive);
+          const existing = await ctx.storage.get(workerKey(input.sessionID));
+          if (existing) {
+            if (existing.hiveID !== hive.id)
+              throw new Error(`${input.sessionID} belongs to Hive ${existing.hiveID}`);
+            if (existing.identityState !== "recovered") {
+              return text(`Session ${input.sessionID} is already attached to ${hive.name}.`);
+            }
+          }
+          const agent = hive.agents[input.agent];
+          if (!agent)
+            throw new Error(`Unknown Hive agent: ${input.agent}`);
+          const resolved = resolveWorkspace(hive, input.workspace);
+          await assertWorkspaceDirectory(resolved.workspace);
+          const session = await ctx.session.get({ sessionID: input.sessionID });
+          if (session.location.directory !== resolved.workspace.directory) {
+            throw new Error(`${input.sessionID} is in ${session.location.directory}, not ${resolved.workspace.directory}`);
+          }
+          const metadata = session.metadata;
+          const metadataHiveID = metadataString(metadata, "hiveID");
+          if (metadataHiveID && metadataHiveID !== hive.id) {
+            throw new Error(`${input.sessionID} has metadata for Hive ${metadataHiveID}`);
+          }
+          const dispatchID = metadataString(metadata, "hiveDispatchID") ?? `reattach_${crypto.randomUUID()}`;
+          const worker = {
+            hiveID: hive.id,
+            sessionID: session.id,
+            channelSessionID: channel.sessionID,
+            channelDirectory: channel.directory,
+            agentName: input.agent,
+            projectName: resolved.projectName,
+            workspaceName: resolved.workspace.name,
+            workspaceDirectory: resolved.workspace.directory,
+            dispatchID,
+            createdAt: session.time.created,
+            lastDispatchAt: session.time.updated,
+            dispatchCount: 1,
+            request: "Session explicitly reattached by the Hive controller.",
+            memoryItems: [],
+            configPath: hive.configPath,
+            permissionMode: resolved.workspace.permissionMode ?? agent.permissionMode ?? hive.permissionMode,
+            identityState: "active"
+          };
+          await saveWorker(ctx, worker);
+          await ctx.storage.remove(detachedWorkerKey(session.id));
+          await ctx.storage.remove(`hives/${hive.id}/detached/${session.id}`);
+          await ctx.session.synthetic({
+            sessionID: session.id,
+            text: `Reattached to Hive ${hive.name} as ${input.agent} in ${resolved.reference}.`,
+            description: "Hive worker reattached",
+            resume: false,
+            metadata: {
+              hiveID: hive.id,
+              hiveAgent: input.agent,
+              hiveWorkspace: resolved.reference,
+              hiveChannelSessionID: channel.sessionID,
+              sourceSessionID: tool.sessionID
+            }
+          });
+          return text(`Reattached ${input.agent} in ${resolved.reference}.
+Session: ${session.id}
+Open: ${openChamberLink(session.id, resolved.workspace.directory)}`);
         }
       });
       editor.add({
@@ -780,7 +989,7 @@ Session: ${tool.sessionID}`);
           const { hive, channel } = await controllerHive(ctx, tool.sessionID, input.hive);
           const resolved = resolveWorkspace(hive, input.workspace);
           await assertWorkspaceDirectory(resolved.workspace);
-          const previous = input.sessionID ? await ctx.storage.get(workerKey(input.sessionID)) : undefined;
+          const previous = input.sessionID ? await workerForSession(ctx, input.sessionID) : undefined;
           if (mode === "continue" && !previous)
             throw new Error(`Unknown Hive worker session: ${input.sessionID}`);
           const agentName = input.agent ?? previous?.agentName ?? resolved.workspace.defaultAgent;
@@ -812,7 +1021,10 @@ Session: ${tool.sessionID}`);
               hiveAgent: agentName,
               hiveWorkspace: resolved.reference,
               hiveDispatchID: dispatchID,
-              hiveChannelSessionID: tool.sessionID
+              hiveChannelSessionID: tool.sessionID,
+              hiveChannelDirectory: channel.directory,
+              hiveConfigPath: hive.configPath,
+              hivePermissionMode: permissionMode
             }
           });
           if (session.location.directory !== resolved.workspace.directory) {
@@ -828,6 +1040,7 @@ Session: ${tool.sessionID}`);
             memoryItems: input.memoryItems ?? [],
             configPath: hive.configPath,
             permissionMode,
+            identityState: "active",
             lastDispatchAt: dispatchedAt,
             dispatchCount: (previous.dispatchCount ?? 1) + 1,
             pendingQuestion: undefined
@@ -848,7 +1061,8 @@ Session: ${tool.sessionID}`);
             relevantSummary: input.relevantSummary,
             memoryItems: input.memoryItems ?? [],
             configPath: hive.configPath,
-            permissionMode
+            permissionMode,
+            identityState: "active"
           };
           const dispatch = {
             hiveID: hive.id,
@@ -918,9 +1132,7 @@ Session: ${tool.sessionID}`);
         execute: async (rawInput, tool) => {
           const input = rawInput;
           const { hive } = await controllerHive(ctx, tool.sessionID, input.hive);
-          const worker = await ctx.storage.get(workerKey(input.sessionID));
-          if (!worker)
-            throw new Error(`Unknown Hive worker session: ${input.sessionID}`);
+          const worker = await workerForSession(ctx, input.sessionID);
           if (worker.hiveID !== hive.id)
             throw new Error(`${input.sessionID} belongs to Hive ${worker.hiveID}`);
           await ctx.session.get({ sessionID: worker.sessionID });
@@ -956,7 +1168,9 @@ ${input.relevantSummary}` : undefined
         options: { namespace: "hive" },
         execute: async (rawInput, tool) => {
           const input = rawInput;
-          const caller = await ctx.storage.get(workerKey(tool.sessionID));
+          const caller = await workerForSession(ctx, tool.sessionID).catch(() => {
+            return;
+          });
           let hive;
           if (caller) {
             if (input.hive && input.hive !== caller.hiveID) {
@@ -994,9 +1208,7 @@ ${input.relevantSummary}` : undefined
         options: { namespace: "hive" },
         execute: async (rawInput, tool) => {
           const input = rawInput;
-          const record = await ctx.storage.get(workerKey(tool.sessionID));
-          if (!record)
-            throw new Error("This session is not a Hive worker session");
+          const record = await workerForSession(ctx, tool.sessionID);
           const hive = await hiveForWorker(ctx, record);
           const [updates, markdown, reports, sessions] = await Promise.all([
             channelUpdates(ctx, record, hive.channel.contextMessages),
@@ -1054,9 +1266,7 @@ ${markdown}` : undefined
         options: { namespace: "hive" },
         execute: async (rawInput, tool) => {
           const input = rawInput;
-          const worker = await ctx.storage.get(workerKey(tool.sessionID));
-          if (!worker)
-            throw new Error("This session is not a Hive worker session");
+          const worker = await workerForSession(ctx, tool.sessionID);
           if (worker.pendingQuestion) {
             throw new Error(`Question ${worker.pendingQuestion.id} is still awaiting a controller reply`);
           }
@@ -1121,9 +1331,7 @@ ${markdown}` : undefined
         execute: async (rawInput, tool) => {
           const input = rawInput;
           const { hive } = await controllerHive(ctx, tool.sessionID, input.hive);
-          const worker = await ctx.storage.get(workerKey(input.sessionID));
-          if (!worker)
-            throw new Error(`Unknown Hive worker session: ${input.sessionID}`);
+          const worker = await workerForSession(ctx, input.sessionID);
           if (worker.hiveID !== hive.id)
             throw new Error(`${input.sessionID} belongs to Hive ${worker.hiveID}`);
           if (input.questionID && worker.pendingQuestion?.id !== input.questionID) {
@@ -1168,9 +1376,7 @@ ${markdown}` : undefined
         options: { namespace: "hive" },
         execute: async (rawInput, tool) => {
           const input = rawInput;
-          const worker = await ctx.storage.get(workerKey(tool.sessionID));
-          if (!worker)
-            throw new Error("This session is not a Hive worker session");
+          const worker = await workerForSession(ctx, tool.sessionID);
           const pending = worker.pendingQuestion;
           if (!pending || pending.id !== input.questionID) {
             throw new Error(`No pending question ${input.questionID} for this worker`);
@@ -1204,9 +1410,7 @@ ${markdown}` : undefined
         options: { namespace: "hive" },
         execute: async (rawInput, tool) => {
           const input = rawInput;
-          const worker = await ctx.storage.get(workerKey(tool.sessionID));
-          if (!worker)
-            throw new Error("This session is not a Hive worker session");
+          const worker = await workerForSession(ctx, tool.sessionID);
           const source = await initiatingDirectUserMessage(ctx, tool);
           const sourceText = clamp(oneLine(source.text), 4000) ?? "";
           const authorization = {
@@ -1289,9 +1493,7 @@ ${markdown}` : undefined
         options: { namespace: "hive" },
         execute: async (rawInput, tool) => {
           const input = rawInput;
-          const record = await ctx.storage.get(workerKey(tool.sessionID));
-          if (!record)
-            throw new Error("This session is not a Hive worker session");
+          const record = await workerForSession(ctx, tool.sessionID);
           if (input.status === "blocked" && record.pendingQuestion?.blocking) {
             return text(`Blocked report suppressed because ${record.pendingQuestion.id} already represents this blocked state.`, { hiveID: record.hiveID, questionID: record.pendingQuestion.id, suppressed: true });
           }
@@ -1349,9 +1551,17 @@ ${markdown}` : undefined
           const hive = await selectHive(ctx, hives, tool.sessionID, input.hive);
           const workers = await ctx.storage.scan({ prefix: `hives/${hive.id}/workers/`, limit: 1000 });
           const records = workers.entries.map((entry) => entry.value).sort((left, right) => (right.lastDispatchAt ?? right.createdAt) - (left.lastDispatchAt ?? left.createdAt));
-          if (records.length === 0)
+          const detached = await ctx.storage.scan({ prefix: `hives/${hive.id}/detached/`, limit: 1000 });
+          const detachedRecords = detached.entries.map((entry) => entry.value).sort((left, right) => right.detachedAt - left.detachedAt);
+          if (records.length === 0 && detachedRecords.length === 0) {
             return text(`No worker sessions for ${hive.name}.`);
-          return text(records.map((record) => `- ${record.agentName} in ${record.projectName}/${record.workspaceName}: ${record.sessionID} | dispatches: ${record.dispatchCount ?? 1} | last status: ${record.lastStatus ?? "not reported"}${record.pendingQuestion ? ` | ${record.pendingQuestion.status === "awaiting-controller" ? "awaiting controller" : "reply awaiting receipt"}: ${record.pendingQuestion.id}` : ""} | ${openChamberLink(record.sessionID, record.workspaceDirectory)}`).join(`
+          }
+          const active = records.map((record) => `- ${record.agentName} in ${record.projectName}/${record.workspaceName}: ${record.sessionID} | dispatches: ${record.dispatchCount ?? 1} | last status: ${record.lastStatus ?? "not reported"}${record.identityState === "recovered" ? " | identity: recovered, permissions: ask" : ""}${record.pendingQuestion ? ` | ${record.pendingQuestion.status === "awaiting-controller" ? "awaiting controller" : "reply awaiting receipt"}: ${record.pendingQuestion.id}` : ""} | ${openChamberLink(record.sessionID, record.workspaceDirectory)}`);
+          const historical = detachedRecords.map((record) => `- detached ${record.sessionID} | ${record.reason} at ${new Date(record.detachedAt).toISOString()}`);
+          return text([
+            ...active.length ? ["Active workers:", ...active] : [],
+            ...historical.length ? ["Detached historical sessions:", ...historical] : []
+          ].join(`
 `));
         }
       });
@@ -1362,4 +1572,4 @@ export {
   src_default as default
 };
 
-//# debugId=7904DDFCDE0A874764756E2164756E21
+//# debugId=2F1C8433A64D35E364756E2164756E21

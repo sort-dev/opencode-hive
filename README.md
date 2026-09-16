@@ -17,6 +17,7 @@ The current spike supports:
 - Advisory consultation with existing worker context
 - Worker questions, controller replies, and recent report lookup
 - Worker reply receipts and verified user-authorized requests to the controller
+- Worker identity recovery, explicit reattachment, reset tombstones, and compare-and-swap channel replacement
 - Hive, agent, and workspace permission modes for launched workers
 - Progress reports routed back to the Hive channel
 - Durable worker-to-Hive mappings
@@ -61,6 +62,8 @@ The OpenChamber V2 preview also writes an `opencode.managed.json` file. In previ
 6. A worker that needs more context calls `hive_backfill_details` with a focused question.
 7. A worker that still needs a decision calls `hive_ask_controller`; the controller answers with `hive_reply`.
 8. The worker acknowledges receipt with `hive_ack_reply`. Direct user instructions relayed from a worker use `hive_request_controller` and retain their OpenCode message reference.
+
+When replacing a channel, pass both `replace: true` and the currently registered channel as `expectedChannelSessionID`. An intentional `clearHistory` reset detaches workers without deleting their OpenCode sessions. Detached sessions do not silently recover; restore one with `hive_reattach_worker` after verifying its agent and workspace. Automatically reconstructed workers use `ask` permissions until the controller explicitly continues or reattaches them.
 
 Special mention syntax is not required. Ordinary phrasing is enough as long as the coordinator resolves it to the typed dispatch tool.
 

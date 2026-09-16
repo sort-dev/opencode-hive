@@ -13,6 +13,8 @@
   controller replies, and recent-status lookup.
 - Blocking-question deduplication, explicit reply receipts, and worker-relayed
   controller requests backed by direct OpenCode user-message references.
+- Worker recovery from session metadata, explicit reattachment, reset
+  tombstones, and compare-and-swap channel replacement.
 - Standalone and embedded Hive model documented.
 - Parent and child Hive federation model documented.
 - Verified build artifact with build identity and server diagnostics in
